@@ -1,258 +1,120 @@
 # utils.py
-
+import os
 import pickle
 import requests
 import streamlit as st
 
-# ----------------------------------------------------
-# Configuration
-# ----------------------------------------------------
+# -------------------------------------------------------
+# Path setup — anchored to this file's location, not cwd
+# -------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE_DIR, "models")
 
-MOVIE_MODEL = "models/movie_list.pkl"
-SIMILARITY_MODEL = "models/similarity.pkl"
+MOVIE_MODEL = os.path.join(MODEL_DIR, "movie_list.pkl")
+SIMILARITY_MODEL = os.path.join(MODEL_DIR, "similarity.pkl")
 
-# Replace with your TMDb API Key
-TMDB_API_KEY = "YOUR_TMDB_API_KEY"
+# If your files are too large for git, host them somewhere
+# (Google Drive, Hugging Face, S3) and set direct download URLs here.
+# Leave blank ("") if your files are committed to the repo directly.
+MOVIE_MODEL_URL = ""       # e.g. "https://huggingface.co/.../movie_list.pkl"
+SIMILARITY_MODEL_URL = ""  # e.g. "https://huggingface.co/.../similarity.pkl"
 
-DEFAULT_POSTER = "https://via.placeholder.com/300x450?text=No+Poster"
 
-# ----------------------------------------------------
-# Load Models
-# ----------------------------------------------------
+def _download_if_missing(path, url):
+    """Download a model file if it's not present locally."""
+    if os.path.exists(path):
+        return
+    if not url:
+        raise FileNotFoundError(
+            f"Model file not found at {path} and no download URL was provided. "
+            f"Make sure the file is committed to the repo, or set a download URL."
+        )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with st.spinner(f"Downloading {os.path.basename(path)}..."):
+        response = requests.get(url, stream=True, timeout=60)
+        response.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
 
+
+# -------------------------------------------------------
+# Cached model loading — loads once per session, not per rerun
+# -------------------------------------------------------
 @st.cache_resource
 def load_models():
-    """
-    Load movie dataframe and similarity matrix.
-    """
-
-    with open(MOVIE_MODEL, "rb") as f:
-        movies = pickle.load(f)
-
-    with open(SIMILARITY_MODEL, "rb") as f:
-        similarity = pickle.load(f)
-
-    return movies, similarity
-
-
-# ----------------------------------------------------
-# Fetch Poster from TMDb
-# ----------------------------------------------------
-
-def fetch_poster(movie_name):
-    """
-    Fetch movie poster using TMDb Search API.
-    """
-
     try:
+        _download_if_missing(MOVIE_MODEL, MOVIE_MODEL_URL)
+        _download_if_missing(SIMILARITY_MODEL, SIMILARITY_MODEL_URL)
 
-        url = (
-            "https://api.themoviedb.org/3/search/movie"
-            f"?api_key={TMDB_API_KEY}"
-            f"&query={movie_name}"
+        with open(MOVIE_MODEL, "rb") as f:
+            movies = pickle.load(f)
+
+        with open(SIMILARITY_MODEL, "rb") as f:
+            similarity = pickle.load(f)
+
+        return movies, similarity
+
+    except FileNotFoundError as e:
+        st.error(
+            "Model files could not be loaded. Please check that "
+            "movie_list.pkl and similarity.pkl are present in the "
+            "'models' folder, or that a valid download URL is configured."
         )
-
-        response = requests.get(url, timeout=10).json()
-
-        results = response.get("results")
-
-        if results:
-
-            poster_path = results[0].get("poster_path")
-
-            if poster_path:
-                return (
-                    "https://image.tmdb.org/t/p/w500"
-                    + poster_path
-                )
-
-    except Exception:
-        pass
-
-    return DEFAULT_POSTER
+        raise e
+    except Exception as e:
+        st.error(f"Unexpected error loading models: {e}")
+        raise e
 
 
-# ----------------------------------------------------
-# Fetch Movie Details
-# ----------------------------------------------------
-
-def fetch_movie_details(movie_name):
-    """
-    Get movie details from TMDb.
-    """
-
-    try:
-
-        url = (
-            "https://api.themoviedb.org/3/search/movie"
-            f"?api_key={TMDB_API_KEY}"
-            f"&query={movie_name}"
-        )
-
-        response = requests.get(url, timeout=10).json()
-
-        results = response.get("results")
-
-        if results:
-
-            movie = results[0]
-
-            return {
-
-                "title": movie.get("title"),
-
-                "rating": round(movie.get("vote_average", 0), 1),
-
-                "overview": movie.get("overview", "No overview available."),
-
-                "release": movie.get("release_date", "Unknown"),
-
-                "poster": fetch_poster(movie_name)
-
-            }
-
-    except Exception:
-        pass
-
-    return {
-
-        "title": movie_name,
-
-        "rating": "N/A",
-
-        "overview": "No description available.",
-
-        "release": "Unknown",
-
-        "poster": DEFAULT_POSTER
-
-    }
+# -------------------------------------------------------
+# Movie titles list
+# -------------------------------------------------------
+@st.cache_data
+def movie_titles():
+    movies, _ = load_models()
+    return movies["title"].values
 
 
-# ----------------------------------------------------
-# Recommend Movies
-# ----------------------------------------------------
-
-def recommend(movie_name, top_n=10):
-    """
-    Return top recommended movies.
-    """
-
+# -------------------------------------------------------
+# Recommendation logic
+# -------------------------------------------------------
+def recommend(movie_title, top_n=10):
     movies, similarity = load_models()
 
-    movie_name = movie_name.lower()
-
-    indices = movies[
-        movies["title"].str.lower() == movie_name
-    ].index
-
-    if len(indices) == 0:
+    matches = movies[movies["title"] == movie_title]
+    if matches.empty:
         return []
 
-    index = indices[0]
-
-    distances = list(enumerate(similarity[index]))
-
+    index = matches.index[0]
     distances = sorted(
-        distances,
+        list(enumerate(similarity[index])),
         key=lambda x: x[1],
         reverse=True
-    )[1:top_n + 1]
+    )
 
     recommendations = []
-
-    for i in distances:
-
-        movie = movies.iloc[i[0]]
-
+    for i, _score in distances[1: top_n + 1]:
+        row = movies.iloc[i]
         recommendations.append({
-
-            "title": movie["title"],
-
-            "rating": movie.get("rating", "N/A"),
-
-            "year": movie.get("release_year", ""),
-
-            "runtime": movie.get("runtime", ""),
-
-            "poster": fetch_poster(movie["title"])
-
+            "title": row.get("title", "Unknown"),
+            "poster": row.get("poster", ""),  # fallback handled in app.py
+            "rating": row.get("rating", "N/A"),
+            "year": row.get("year", "N/A"),
+            "runtime": row.get("runtime", "N/A"),
         })
 
     return recommendations
 
 
-# ----------------------------------------------------
-# Movie List
-# ----------------------------------------------------
-
-def movie_titles():
-    """
-    Return sorted movie titles.
-    """
-
-    movies, _ = load_models()
-
-    return sorted(movies["title"].tolist())
-
-
-# ----------------------------------------------------
-# Search Movies
-# ----------------------------------------------------
-
-def search_movies(keyword):
-    """
-    Search movie names.
-    """
-
-    movies, _ = load_models()
-
-    keyword = keyword.lower()
-
-    return sorted(
-        movies[
-            movies["title"].str.lower().str.contains(keyword)
-        ]["title"].tolist()
-    )
-
-
-# ----------------------------------------------------
-# Top Rated Movies
-# ----------------------------------------------------
-
-def top_rated(limit=10):
-    """
-    Return highest rated movies.
-    """
-
-    movies, _ = load_models()
-
-    return (
-        movies.sort_values(
-            by="rating",
-            ascending=False
-        )
-        .head(limit)
-    )
-
-
-# ----------------------------------------------------
-# Statistics
-# ----------------------------------------------------
-
+# -------------------------------------------------------
+# Sidebar statistics
+# -------------------------------------------------------
+@st.cache_data
 def statistics():
-
     movies, _ = load_models()
-
     return {
-
         "movies": len(movies),
-
-        "highest_rating": movies["rating"].max(),
-
-        "average_rating": round(
-            movies["rating"].mean(),
-            2
-        )
-
+        "highest_rating": movies["rating"].max() if "rating" in movies else "N/A",
+        "average_rating": round(movies["rating"].mean(), 2) if "rating" in movies else "N/A",
     }
